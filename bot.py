@@ -11,6 +11,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from aiohttp import web
+from httpx import *
 
 # --- ENV VARS ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
