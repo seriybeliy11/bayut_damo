@@ -1,127 +1,139 @@
-"""
-Точка входа: Telegram-бот для управления инвойсами 2328.io.
-
-Использует long polling — идеально подходит для Render Background Worker.
-Никаких внешних фреймворков, только requests.
-"""
-import logging
-import sys
+import os
+import json
+import hmac
+import hashlib
+import base64
 import time
+import csv
+import logging
+from datetime import datetime
 
-import config
-import handlers
-import state
-import telegram_api
-from telegram_api import TelegramError
+import httpx
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import Message
+from aiohttp import web
 
-# ───────────────────────── Логирование ─────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-# Уменьшаем спам от requests.
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-log = logging.getLogger("bot")
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
 
+# Безопасное получение токенов из переменных окружения Render
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+PROJECT_UUID = os.getenv("PROJECT_UUID")
+API_KEY = os.getenv("API_KEY")
 
-# ───────────────────────── Роутинг апдейтов ─────────────────────────
+if not all([BOT_TOKEN, PROJECT_UUID, API_KEY]):
+    raise ValueError("Не заданы переменные окружения BOT_TOKEN, PROJECT_UUID или API_KEY")
 
-def route_update(update: dict):
-    """Маршрутизирует апдейт в нужный обработчик."""
+# Инициализация бота
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# Функция для создания подписи (строго по спецификации 2328.io)
+def api_sign(body: str, api_key: str) -> str:
+    b64 = base64.b64encode(body.encode("utf-8")).decode()
+    return hmac.new(api_key.encode(), b64.encode(), hashlib.sha256).hexdigest()
+
+# Функция для сохранения в CSV
+def save_subscription_to_csv(user_id: int, username: str, amount: float, order_id: str):
+    file_exists = os.path.isfile('subscriptions.csv')
+    with open('subscriptions.csv', 'a', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        # Если файл пустой, пишем заголовки
+        if not file_exists:
+            writer.writerow(['user_id', 'username', 'amount', 'order_id', 'created_at'])
+        # Пишем данные (дата создания инвойса)
+        writer.writerow([user_id, username or "Unknown", amount, order_id, datetime.now().isoformat()])
+
+# Обработчик команды /pay
+@dp.message(Command("pay"))
+async def send_payment(message: Message):
+    # Парсим сумму
     try:
-        if "message" in update:
-            msg = update["message"]
-            text = (msg.get("text") or "").strip()
-            chat_id = msg.get("chat", {}).get("id")
-            user_id = msg.get("from", {}).get("id")
+        amount_str = message.text.split()[1]
+        amount = float(amount_str)
+        if amount <= 0:
+            raise ValueError
+    except (IndexError, ValueError):
+        await message.answer("Используйте формат: /pay <сумма>\nПример: /pay 100")
+        return
 
-            # Если пользователь в каком-то состоянии — сначала обрабатываем FSM.
-            if (
-                user_id
-                and state.get_state(user_id) != state.STATE_IDLE
-                and not text.startswith("/")
-            ):
-                handlers.handle_text(update)
-                return
+    # Формируем уникальный ID заказа
+    order_id = f"ORDER-{message.from_user.id}-{int(time.time())}"
 
-            # Команды.
-            if text.startswith("/"):
-                cmd = text.split()[0].lower().split("@")[0]
-                if cmd in ("/start", "/help", "/pay", "/status", "/list", "/cancel"):
-                    {
-                        "/start":  handlers.cmd_start,
-                        "/help":   handlers.cmd_help,
-                        "/pay":    handlers.cmd_pay,
-                        "/status": handlers.cmd_status,
-                        "/list":   handlers.cmd_list,
-                        "/cancel": handlers.cmd_cancel,
-                    }[cmd](update)
-                    return
-                # Неизвестная команда.
-                telegram_api.send_message(
-                    chat_id,
-                    f"Неизвестная команда: <code>{cmd}</code>. Напиши /help.",
-                )
-                return
+    # Подготавливаем payload строго по ТЗ (без лишних пробелов)
+    data = {
+        "amount": f"{amount:.2f}",
+        "currency": "USD",
+        "order_id": order_id,
+        "url_callback": "https://placeholder.com/webhook" # Заглушка, так как вебхук не обрабатывается
+    }
+    
+    body = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+    sign = api_sign(body, API_KEY)
 
-            # Обычный текст (без состояния).
-            handlers.handle_text(update)
-            return
-
-        if "callback_query" in update:
-            handlers.handle_callback(update)
-            return
-
-        log.debug("Unknown update type, skipping: %s", list(update.keys()))
-    except Exception:  # noqa: BLE001
-        log.exception("route_update failed")
-
-
-# ───────────────────────── Главный цикл ─────────────────────────
-
-def main():
-    errors = config.validate()
-    if errors:
-        log.error("Конфигурация неполная:")
-        for e in errors:
-            log.error("  • %s", e)
-        sys.exit(1)
-
-    log.info("Bot starting…")
-    handlers.setup_bot_commands()
-
-    offset = None
-    empty_polls = 0
-
-    while True:
+    # Выполняем запрос к API 2328.io
+    async with httpx.AsyncClient() as client:
         try:
-            updates = telegram_api.get_updates(offset=offset, timeout=config.LONG_POLL_TIMEOUT)
-            if updates:
-                empty_polls = 0
-                for upd in updates:
-                    offset = upd["update_id"] + 1
-                    route_update(upd)
-            else:
-                empty_polls += 1
-                if empty_polls % 60 == 0:
-                    log.info("Long-poll idle… (offset=%s)", offset)
+            r = await client.post(
+                "https://api.2328.io/api/v1/payment",
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "MyTelegramBot/1.0",
+                    "project": PROJECT_UUID,
+                    "sign": sign,
+                },
+                content=body.encode("utf-8"),
+                timeout=10.0
+            )
+            response = r.json()
+        except httpx.RequestError as e:
+            logging.error(f"Ошибка сети при обращении к 2328.io: {e}")
+            await message.answer("Ошибка связи с платежной системой. Попробуйте позже.")
+            return
 
-        except TelegramError as e:
-            log.warning("Telegram error в главном цикле: %s", e)
-            # На 409 Conflict — кто-то ещё запустил бота с тем же токеном.
-            if e.error_code == 409:
-                log.error("409 Conflict: возможно, бот уже запущен в другом месте. Жду 10 сек.")
-                time.sleep(10)
-            else:
-                time.sleep(3)
-        except KeyboardInterrupt:
-            log.info("Остановка по Ctrl+C.")
-            break
-        except Exception:  # noqa: BLE001
-            log.exception("Непредвиденная ошибка в главном цикле. Жду 5 сек.")
-            time.sleep(5)
+    # Обработка ответа
+    if response.get("state") == 0:
+        tg_deeplink = response["result"]["tg_deeplink"]
+        
+        # Сохраняем в CSV
+        save_subscription_to_csv(
+            user_id=message.from_user.id,
+            username=message.from_user.username,
+            amount=amount,
+            order_id=order_id
+        )
+        
+        await message.answer(f"💰 Оплата подписки на ${amount:.2f}\n\nПерейдите по ссылке для оплаты:\n{tg_deeplink}")
+    else:
+        logging.error(f"Ошибка API 2328.io: {response}")
+        await message.answer("Ошибка при создании платежа. Проверьте логи.")
 
+# --- Настройка веб-сервера для Render ---
+# Render требует, чтобы приложение слушало порт, мы используем aiohttp для здоровья сервиса
+async def health_check(request):
+    return web.Response(text="Bot is running")
+
+async def main():
+    # Запускаем поллинг бота в фоне
+    bot_task = asyncio.create_task(dp.start_polling(bot))
+    
+    # Поднимаем веб-сервер для Render (Health Check)
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    
+    logging.info(f"Web server started on port {port}")
+    
+    # Ожидаем завершения работы бота
+    await bot_task
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
